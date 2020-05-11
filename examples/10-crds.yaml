@@ -90,6 +90,9 @@ spec:
                 - email
                 - server
               type: object
+            requestsPerDayQuota:
+              description: RequestsPerDayQuota is the maximum number of certificate requests per days allowed for this issuer
+              type: integer
           type: object
         status:
           description: IssuerStatus is the status of the issuer.
@@ -103,6 +106,9 @@ spec:
             observedGeneration:
               description: ObservedGeneration is the observed generation of the spec.
               format: int64
+              type: integer
+            requestsPerDayQuota:
+              description: RequestsPerDayQuota is the actual maximum number of certificate requests per days allowed for this issuer
               type: integer
             state:
               description: State is either empty, 'Pending', 'Error', or 'Ready'.

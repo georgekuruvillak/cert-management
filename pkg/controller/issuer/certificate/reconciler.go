@@ -114,38 +114,35 @@ func CertReconciler(c controller.Interface, support *core.Support) (reconcile.In
 }
 
 type recoverableError struct {
-	Msg string
+	Msg      string
+	Interval time.Duration
 }
 
 func (err *recoverableError) Error() string {
 	return err.Msg
 }
 
-func isRecoverableError(err error) bool {
-	_, ok := err.(*recoverableError)
-	return ok
-}
-
 type certReconciler struct {
 	reconcile.DefaultReconciler
-	support             *core.Support
-	obtainer            legobridge.Obtainer
-	targetCluster       cluster.Interface
-	dnsCluster          cluster.Interface
-	certResources       resources.Interface
-	certSecretResources resources.Interface
-	rateLimiting        time.Duration
-	pendingRequests     *legobridge.PendingCertificateRequests
-	pendingResults      *legobridge.PendingResults
-	dnsNamespace        *string
-	dnsClass            *string
-	dnsOwnerID          *string
-	precheckNameservers []string
-	additionalWait      time.Duration
-	renewalWindow       time.Duration
-	renewalCheckPeriod  time.Duration
-	classes             *controller.Classes
-	cascadeDelete       bool
+	support                    *core.Support
+	obtainer                   legobridge.Obtainer
+	targetCluster              cluster.Interface
+	dnsCluster                 cluster.Interface
+	certResources              resources.Interface
+	certSecretResources        resources.Interface
+	rateLimiting               time.Duration
+	pendingRequests            *legobridge.PendingCertificateRequests
+	pendingResults             *legobridge.PendingResults
+	dnsNamespace               *string
+	dnsClass                   *string
+	dnsOwnerID                 *string
+	precheckNameservers        []string
+	additionalWait             time.Duration
+	renewalWindow              time.Duration
+	renewalCheckPeriod         time.Duration
+	defaultRequestsPerDayQuota int
+	classes                    *controller.Classes
+	cascadeDelete              bool
 }
 
 func (r *certReconciler) Start() {
@@ -221,14 +218,24 @@ func (r *certReconciler) Deleted(logger logger.LogContext, key resources.Cluster
 }
 
 func (r *certReconciler) lastPendingRateLimiting(timestamp *metav1.Time) bool {
-	return timestamp != nil && timestamp.Add(r.rateLimiting).After(time.Now())
+	endTime := r.rateLimitingEndTime(timestamp)
+	return endTime != nil && endTime.After(time.Now())
+}
+
+func (r *certReconciler) rateLimitingEndTime(timestamp *metav1.Time) *time.Time {
+	if timestamp == nil {
+		return nil
+	}
+	endTime := timestamp.Add(r.rateLimiting)
+	return &endTime
 }
 
 func (r *certReconciler) lastPendingRateLimitingSeconds(timestamp *metav1.Time) int {
-	if timestamp == nil {
+	endTime := r.rateLimitingEndTime(timestamp)
+	if endTime == nil {
 		return 0
 	}
-	seconds := int(timestamp.Add(r.rateLimiting).Sub(time.Now()).Seconds() + 0.5)
+	seconds := int(endTime.Sub(time.Now()).Seconds() + 0.5)
 	if seconds > 0 {
 		return seconds
 	}
@@ -265,6 +272,18 @@ func (r *certReconciler) obtainCertificateAndPending(logger logger.LogContext, o
 		return r.updateSecretRefAndSucceeded(logger, obj, secretRef, specHash, notAfter)
 	}
 
+	issuerObjectName := r.issuerObjectName(&cert.Spec)
+	if accepted, requestsPerDayQuota := r.support.TryAcceptCertificateRequest(issuerObjectName); !accepted {
+		waitMinutes := 1440 / requestsPerDayQuota / 2
+		if waitMinutes < 5 {
+			waitMinutes = 5
+		}
+		err := fmt.Errorf("request quota exhausted. Retrying in %d min. "+
+			"Up to %d requests per day are allowed. To change the quota, set `spec.requestsPerDayQuota` for issuer %s",
+			waitMinutes, requestsPerDayQuota, issuerObjectName)
+		return r.recheck(logger, obj, api.StatePending, err, time.Duration(waitMinutes)*time.Minute)
+	}
+
 	var renewCert *certificate.Resource
 	if renewSecret != nil {
 		renewCert = legobridge.SecretDataToCertificates(renewSecret.Data)
@@ -295,7 +314,7 @@ func (r *certReconciler) obtainCertificateAndPending(logger logger.LogContext, o
 		targetDNSClass = *r.dnsClass
 	}
 	input := legobridge.ObtainInput{User: reguser, DNSCluster: r.dnsCluster, DNSSettings: dnsSettings,
-		CaDirURL: server, IssuerName: r.issuerName(&cert.Spec),
+		CaDirURL: server, IssuerName: issuerObjectName.Name(),
 		CommonName: cert.Spec.CommonName, DNSNames: cert.Spec.DNSNames, CSR: cert.Spec.CSR,
 		TargetClass: targetDNSClass, Callback: callback, RequestName: objectName, RenewCert: renewCert}
 
@@ -328,7 +347,7 @@ func (r *certReconciler) restoreRegUser(crt *api.Certificate) (*legobridge.Regis
 	}
 	if issuer.Status.State != api.StateReady {
 		if issuer.Status.State != api.StateError {
-			return nil, "", &recoverableError{fmt.Sprintf("referenced issuer not ready: state=%s", issuer.Status.State)}
+			return nil, "", &recoverableError{Msg: fmt.Sprintf("referenced issuer not ready: state=%s", issuer.Status.State)}
 		}
 		return nil, "", fmt.Errorf("referenced issuer not ready: state=%s", issuer.Status.State)
 	}
@@ -649,14 +668,22 @@ func (r *certReconciler) failed(logger logger.LogContext, obj resources.Object, 
 	mod, _ := r.prepareUpdateStatus(obj, state, &msg)
 	r.updateStatus(mod)
 
-	if isRecoverableError(err) {
+	if rerr, ok := err.(*recoverableError); ok {
+		if rerr.Interval != 0 {
+			return reconcile.Recheck(logger, err, rerr.Interval)
+		}
 		return reconcile.Delay(logger, err)
 	}
+
 	return reconcile.Failed(logger, err)
 }
 
 func (r *certReconciler) delay(logger logger.LogContext, obj resources.Object, state string, err error) reconcile.Status {
 	return r.failed(logger, obj, state, &recoverableError{Msg: err.Error()})
+}
+
+func (r *certReconciler) recheck(logger logger.LogContext, obj resources.Object, state string, err error, interval time.Duration) reconcile.Status {
+	return r.failed(logger, obj, state, &recoverableError{Msg: err.Error(), Interval: interval})
 }
 
 func (r *certReconciler) succeeded(logger logger.LogContext, obj resources.Object) reconcile.Status {
